@@ -200,7 +200,9 @@ class AkaiComic : HttpSource() {
                 else -> nested
             }
         }
+
         is JsonArray -> this.firstOrNull() ?: this
+
         else -> this
     }
 
