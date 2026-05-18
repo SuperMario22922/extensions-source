@@ -1,11 +1,20 @@
 package eu.kanade.tachiyomi.extension.en.comix
 
+import android.annotation.SuppressLint
+import android.app.Application
 import android.content.SharedPreferences
+import android.os.Handler
+import android.os.Looper
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
+import android.webkit.WebView
+import android.webkit.WebViewClient
 import androidx.preference.ListPreference
 import androidx.preference.MultiSelectListPreference
 import androidx.preference.PreferenceScreen
 import androidx.preference.SwitchPreferenceCompat
 import eu.kanade.tachiyomi.network.GET
+import eu.kanade.tachiyomi.network.awaitSuccess
 import eu.kanade.tachiyomi.network.interceptor.rateLimit
 import eu.kanade.tachiyomi.source.ConfigurableSource
 import eu.kanade.tachiyomi.source.model.FilterList
@@ -17,11 +26,19 @@ import eu.kanade.tachiyomi.source.online.HttpSource
 import keiyoushi.utils.firstInstanceOrNull
 import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.parseAs
+import kotlinx.coroutines.runBlocking
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.Request
 import okhttp3.Response
+import okio.Buffer
+import rx.Observable
+import uy.kohesive.injekt.Injekt
+import uy.kohesive.injekt.api.get
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 
 class Comix :
     HttpSource(),
@@ -36,18 +53,6 @@ class Comix :
     private val preferences: SharedPreferences by getPreferencesLazy()
 
     override val client = network.cloudflareClient.newBuilder()
-        .apply {
-            // Insert at position 0 so requests carrying PROXY_HEADER reach
-            // our interceptor BEFORE any other application interceptor.
-            // Critical for Komu (iOS): its `CallNativeHttpInterceptor`
-            // re-routes comix.to traffic through Foundation NSURLSession
-            // to match Safari's TLS fingerprint and short-circuits the
-            // chain — adding our interceptor at the END would mean it
-            // never sees the request. Placing it first is harmless on
-            // Mihon Android too (no interceptor before us cares about
-            // PROXY_HEADER, and we always pass-through unsigned reqs).
-            interceptors().add(0, WebViewProxyInterceptor)
-        }
         .rateLimit(5)
         .build()
 
@@ -294,76 +299,52 @@ class Comix :
     // ============================= Chapters ==============================
     override fun getChapterUrl(chapter: SChapter) = "$baseUrl/${chapter.url}"
 
-    override fun chapterListRequest(manga: SManga): Request {
-        val hid = manga.url.removePrefix("/").substringBefore("-")
-        val fullSlug = manga.url.removePrefix("/")
-        return chapterListRequest(hid, fullSlug, 1)
-    }
-
-    private fun chapterListRequest(mangaHash: String, mangaSlug: String, page: Int): Request {
-        // Routed through WebViewProxyInterceptor: signing + cookies live inside
-        // a hidden WebView so the request is indistinguishable from one the
-        // site's own JS would issue. The token is computed there too.
-        val url = apiUrl.toHttpUrl().newBuilder()
-            .addPathSegment("manga")
-            .addPathSegment(mangaHash)
-            .addPathSegment("chapters")
-            .addQueryParameter("order[number]", "desc")
-            .addQueryParameter("limit", "100")
-            .addQueryParameter("page", page.toString())
-            .addQueryParameter("mangaSlug", mangaSlug) // carried for chapterListParse
-            .build()
-
-        val proxyHeaders = headers.newBuilder()
-            .add(Signer.PROXY_HEADER, "1")
-            .build()
-        return GET(url, proxyHeaders)
-    }
-
-    override fun chapterListParse(response: Response): List<SChapter> {
+    override fun fetchChapterList(manga: SManga): Observable<List<SChapter>> = runBlocking {
         val deduplicate = preferences.deduplicateChapters()
-        val mangaHash = response.request.url.pathSegments[3]
-        val mangaSlug = response.request.url.queryParameter("mangaSlug") ?: mangaHash // Extract slug
-        var resp: ChapterDetailsResponse = response.parseAs()
+        val mangaSlug = manga.url.removePrefix("/")
+        val hid = mangaSlug.substringBefore("-")
 
-        var chapterMap: LinkedHashMap<Number, Chapter>? = null
-        var chapterList: ArrayList<Chapter>? = null
+        val token = captureToken(
+            pageUrl = getMangaUrl(manga),
+        ) { url ->
+            url.encodedPath.endsWith("api/v1/manga/$hid/chapters")
+        }
 
-        if (deduplicate) {
-            chapterMap = LinkedHashMap()
-            deduplicateChapters(chapterMap, resp.result.items)
+        val allChapters = mutableListOf<Chapter>()
+        var page = 1
+        while (true) {
+            val url = apiUrl.toHttpUrl().newBuilder()
+                .addPathSegment("manga")
+                .addPathSegment(hid)
+                .addPathSegment("chapters")
+                .addQueryParameter("page", page.toString())
+                .addQueryParameter("limit", "100")
+                .addQueryParameter("order[number]", "desc")
+                .addQueryParameter("_", token)
+                .build()
+            val res = client.newCall(GET(url, headers)).awaitSuccess()
+                .parseAs<ChapterDetailsResponse>()
+            allChapters.addAll(res.result.items)
+            if (!res.result.hasNextPage()) break
+            page++
+        }
+
+        val finalChapters: List<Chapter> = if (deduplicate) {
+            val chapterMap = LinkedHashMap<Number, Chapter>()
+            deduplicateChapters(chapterMap, allChapters)
+            chapterMap.values.toList()
         } else {
-            chapterList = ArrayList(resp.result.items)
+            allChapters
         }
 
-        var page = 2
-        var hasNext = resp.result.hasNextPage()
-
-        while (hasNext) {
-            resp = client
-                .newCall(chapterListRequest(mangaHash, mangaSlug, page++))
-                .execute()
-                .parseAs()
-
-            val items = resp.result.items
-
-            if (deduplicate) {
-                deduplicateChapters(chapterMap!!, items)
-            } else {
-                chapterList!!.addAll(items)
-            }
-            hasNext = resp.result.hasNextPage()
-        }
-
-        val finalChapters: List<Chapter> =
-            if (deduplicate) {
-                chapterMap!!.values.toList()
-            } else {
-                chapterList!!
-            }
-
-        return finalChapters.map { it.toSChapter(mangaSlug) }
+        Observable.just(
+            finalChapters.map { it.toSChapter(mangaSlug) },
+        )
     }
+
+    override fun chapterListRequest(manga: SManga): Request = throw UnsupportedOperationException()
+
+    override fun chapterListParse(response: Response): List<SChapter> = throw UnsupportedOperationException()
 
     private fun deduplicateChapters(
         chapterMap: LinkedHashMap<Number, Chapter>,
@@ -397,32 +378,96 @@ class Comix :
     }
 
     // =============================== Pages ===============================
-    override fun pageListRequest(chapter: SChapter): Request {
+    override fun fetchPageList(chapter: SChapter): Observable<List<Page>> = runBlocking {
+        // Legacy URL example: title/qnj9/5241183-chapter-0
+        if (chapter.url.substringAfter("/").substringBeforeLast("/").indexOf("-") == -1) throw Exception("Outdated chapter URL. Please refresh the chapter list")
+
         val chapterId = chapter.url.substringAfterLast("/").substringBefore("-")
+
+        val token = captureToken(
+            pageUrl = getChapterUrl(chapter),
+        ) { url ->
+            url.encodedPath.endsWith("api/v1/chapters/$chapterId")
+        }
+
         val url = apiUrl.toHttpUrl().newBuilder()
             .addPathSegment("chapters")
             .addPathSegment(chapterId)
+            .addQueryParameter("_", token)
             .build()
-        val proxyHeaders = headers.newBuilder()
-            .add(Signer.PROXY_HEADER, "1")
-            .build()
-        return GET(url, proxyHeaders)
-    }
 
-    override fun pageListParse(response: Response): List<Page> {
-        val res: ChapterResponse = response.parseAs()
-        val result = res.result ?: throw Exception("Chapter not found")
-        val pages = result.pages
-        if (pages.items.isEmpty()) {
-            throw Exception("No images found for chapter ${result.id}")
-        }
-        // Page urls are relative to `pages.baseUrl`. Joining manually keeps
-        // existing absolute URLs intact (in case the API switches back).
-        val base = pages.baseUrl.trimEnd('/')
-        return pages.items.mapIndexed { index, img ->
+        val result = client.newCall(GET(url, headers)).awaitSuccess()
+            .parseAs<ChapterResponse>().result.pages
+        val base = result.baseUrl.trimEnd('/')
+        val pages = result.items.mapIndexed { index, img ->
             val full = if (img.url.startsWith("http")) img.url else "$base/${img.url.trimStart('/')}"
             Page(index, imageUrl = full)
         }
+
+        Observable.just(pages)
+    }
+
+    override fun pageListRequest(chapter: SChapter): Request = throw UnsupportedOperationException()
+
+    override fun pageListParse(response: Response): List<Page> = throw UnsupportedOperationException()
+
+    @SuppressLint("SetJavaScriptEnabled")
+    private fun captureToken(pageUrl: String, urlMatches: (HttpUrl) -> Boolean): String {
+        val handler = Handler(Looper.getMainLooper())
+        val latch = CountDownLatch(1)
+        val tokenRef = AtomicReference<String>()
+        var webView: WebView? = null
+        val emptyResponse = WebResourceResponse("text/plain", "utf-8", Buffer().inputStream())
+
+        val createAndLoad = {
+            val view = WebView(Injekt.get<Application>())
+            webView = view
+
+            with(view.settings) {
+                javaScriptEnabled = true
+                domStorageEnabled = true
+                blockNetworkImage = true
+                userAgentString = headers["User-Agent"]
+            }
+
+            view.webViewClient = object : WebViewClient() {
+                override fun shouldInterceptRequest(
+                    view: WebView,
+                    request: WebResourceRequest,
+                ): WebResourceResponse? {
+                    val httpUrl = request.url?.toString()?.toHttpUrlOrNull()
+                        ?: return emptyResponse
+
+                    if (urlMatches(httpUrl)) {
+                        httpUrl.queryParameter("_")?.let { token ->
+                            if (tokenRef.compareAndSet(null, token)) {
+                                latch.countDown()
+                            }
+                        }
+                    }
+
+                    return if (httpUrl.host.contains("comix.to") && (httpUrl.encodedPath.contains(".js") || httpUrl.encodedPath.startsWith("/api/") || httpUrl.encodedPath.startsWith("/title/"))) {
+                        super.shouldInterceptRequest(view, request)
+                    } else {
+                        emptyResponse
+                    }
+                }
+            }
+
+            view.loadUrl(pageUrl)
+        }
+
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            createAndLoad()
+        } else {
+            handler.post(createAndLoad)
+        }
+
+        val completed = latch.await(30, TimeUnit.SECONDS)
+        handler.post { webView?.destroy() }
+
+        if (!completed) throw Exception("Timed out waiting for token")
+        return tokenRef.get() ?: throw Exception("Failed to capture token")
     }
 
     // ============================= Settings =============================
