@@ -10,6 +10,7 @@ import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.util.asJsoup
+import keiyoushi.annotation.Source
 import keiyoushi.lib.cookieinterceptor.CookieInterceptor
 import keiyoushi.utils.extractNextJs
 import keiyoushi.utils.getPreferencesLazy
@@ -18,13 +19,11 @@ import okhttp3.Request
 import okhttp3.Response
 import java.io.IOException
 
-class ComicFesta :
-    ClipStudioReader(
-        "Comic Festa",
-        "https://comic.iowl.jp",
-        "ja",
-    ),
+@Source
+abstract class ComicFesta :
+    ClipStudioReader(),
     ConfigurableSource {
+
     override val supportsLatest = true
 
     private val domain = baseUrl.toHttpUrl().host
@@ -34,7 +33,7 @@ class ComicFesta :
         .build()
 
     override val client = super.client.newBuilder()
-        .addInterceptor(CookieInterceptor(domain, listOf("checked_age" to "1", "sp_display" to "1", "cf_checked_age_guest" to "1", "cf_checked_age" to "1")))
+        .addNetworkInterceptor(CookieInterceptor(domain, listOf("checked_age" to "1", "sp_display" to "1", "cf_checked_age_guest" to "1", "cf_checked_age" to "1")))
         .addInterceptor {
             val request = it.request()
             val response = it.proceed(request)
